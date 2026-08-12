@@ -1,6 +1,7 @@
 #pragma once
 
 #include "esphome/core/component.h"
+#include "esphome/core/hal.h"
 #include "esphome/components/uart/uart.h"
 #include "esphome/components/sensor/sensor.h"
 #include "esphome/components/text_sensor/text_sensor.h"
@@ -64,7 +65,7 @@ class Jura : public PollingComponent, public uart::UARTDevice {
 
   std::string cmd2jura(std::string outbytes) {
     std::string inbytes;
-    int timeout_counter = 0;
+    const uint32_t start_time = millis();
 
     // Clear pending UART data
     while (available()) {
@@ -140,7 +141,7 @@ class Jura : public PollingComponent, public uart::UARTDevice {
         delay(10);
       }
 
-      if (timeout_counter++ > 500) {
+      if (timeout_counter++ > 1500) {
         ESP_LOGW("jura", "Timeout waiting for Jura response");
         return "";
       }
