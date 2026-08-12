@@ -2,10 +2,11 @@
 
 #include "esphome/core/component.h"
 #include "esphome/core/hal.h"
+#include "esphome/core/log.h"
+
 #include "esphome/components/uart/uart.h"
 #include "esphome/components/sensor/sensor.h"
 #include "esphome/components/text_sensor/text_sensor.h"
-#include "esphome/core/log.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -15,430 +16,1035 @@
 #include <string>
 #include <vector>
 
+
 namespace esphome {
 namespace jura {
 
-// ESP-IDF compatible replacements for Arduino bitRead()/bitWrite()
+
+static const char *const TAG = "jura";
+
+
+// -----------------------------------------------------------------------------
+// ESP-IDF-kompatibler Ersatz für Arduino bitRead()
+// -----------------------------------------------------------------------------
+
 static inline uint8_t jura_bit_read(uint8_t value, uint8_t bit) {
-  return static_cast<uint8_t>((value >> bit) & 0x01U);
+  return static_cast<uint8_t>(
+      (value >> bit) & 0x01U
+  );
 }
 
-static inline void jura_bit_write(uint8_t &value, uint8_t bit, bool state) {
+
+// -----------------------------------------------------------------------------
+// ESP-IDF-kompatibler Ersatz für Arduino bitWrite()
+// -----------------------------------------------------------------------------
+
+static inline void jura_bit_write(
+    uint8_t &value,
+    uint8_t bit,
+    bool state) {
+
+  const uint8_t mask =
+      static_cast<uint8_t>(1U << bit);
+
   if (state) {
-    value = static_cast<uint8_t>(value | (1U << bit));
+    value =
+        static_cast<uint8_t>(
+            value | mask
+        );
   } else {
-    value = static_cast<uint8_t>(value & ~(1U << bit));
+    value =
+        static_cast<uint8_t>(
+            value & static_cast<uint8_t>(~mask)
+        );
   }
 }
 
 
-class Jura : public PollingComponent, public uart::UARTDevice {
+// =============================================================================
+// Jura-Komponente
+// =============================================================================
+
+class Jura :
+    public PollingComponent,
+    public uart::UARTDevice {
+
  public:
-  void set_model(const std::string &m) {
-    model_ = m;
+
+  // ---------------------------------------------------------------------------
+  // Modell
+  // ---------------------------------------------------------------------------
+
+  void set_model(const std::string &model) {
+    model_ = model;
   }
 
-  void register_metric_sensor(const std::string &key, sensor::Sensor *s) {
-    numeric_[key] = s;
+
+  // ---------------------------------------------------------------------------
+  // ESPHome Sensoren registrieren
+  // ---------------------------------------------------------------------------
+
+  void register_metric_sensor(
+      const std::string &key,
+      sensor::Sensor *sensor_ptr) {
+
+    numeric_sensors_[key] = sensor_ptr;
   }
 
-  void register_text_sensor(const std::string &key, text_sensor::TextSensor *t) {
-    text_[key] = t;
+
+  void register_text_sensor(
+      const std::string &key,
+      text_sensor::TextSensor *sensor_ptr) {
+
+    text_sensors_[key] = sensor_ptr;
   }
 
-  void publish_number(const std::string &key, float value) {
-    auto it = numeric_.find(key);
 
-    if (it != numeric_.end() && it->second != nullptr) {
-      it->second->publish_state(value);
+  // ---------------------------------------------------------------------------
+  // Werte veröffentlichen
+  // ---------------------------------------------------------------------------
+
+  void publish_number(
+      const std::string &key,
+      float value) {
+
+    auto it =
+        numeric_sensors_.find(key);
+
+    if (it == numeric_sensors_.end()) {
+      return;
     }
-  }
 
-  void publish_text(const std::string &key, const std::string &value) {
-    auto it = text_.find(key);
-
-    if (it != text_.end() && it->second != nullptr) {
-      it->second->publish_state(value);
+    if (it->second == nullptr) {
+      return;
     }
+
+    it->second->publish_state(value);
   }
 
 
-  std::string cmd2jura(std::string outbytes) {
-    std::string inbytes;
-    const uint32_t start_time = millis();
+  void publish_text(
+      const std::string &key,
+      const std::string &value) {
 
-    // Clear pending UART data
+    auto it =
+        text_sensors_.find(key);
+
+    if (it == text_sensors_.end()) {
+      return;
+    }
+
+    if (it->second == nullptr) {
+      return;
+    }
+
+    it->second->publish_state(value);
+  }
+
+
+  // ===========================================================================
+  // Jura UART Kommunikation
+  // ===========================================================================
+
+  std::string cmd2jura(std::string command) {
+
+    std::string response;
+
+
+    // -------------------------------------------------------------------------
+    // Vorhandene Daten im RX Buffer verwerfen
+    // -------------------------------------------------------------------------
+
     while (available()) {
       read();
     }
 
-    // Jura command termination
-    outbytes += "\r\n";
 
-    // -----------------------------------------------------------------------
-    // Encode outgoing bytes
+    // -------------------------------------------------------------------------
+    // Jura erwartet CR/LF
+    // -------------------------------------------------------------------------
+
+    command += "\r\n";
+
+
+    ESP_LOGD(
+        TAG,
+        "TX command: %s",
+        command.c_str()
+    );
+
+
+    // -------------------------------------------------------------------------
+    // Jura Daten codieren
     //
-    // Jura protocol transfers two useful bits per physical UART byte.
-    // Useful bits are placed into bit 2 and bit 5.
-    // -----------------------------------------------------------------------
-    for (size_t i = 0; i < outbytes.size(); ++i) {
-      uint8_t src = static_cast<uint8_t>(outbytes[i]);
+    // Ein logisches Byte wird als 4 UART-Bytes übertragen.
+    //
+    // Nutzdaten:
+    //   UART Bit 2
+    //   UART Bit 5
+    //
+    // Je physischem UART-Byte werden somit 2 Nutzbits übertragen.
+    // -------------------------------------------------------------------------
 
-      for (uint8_t s = 0; s < 8; s += 2) {
-        uint8_t rawbyte = 0xFF;
+    for (size_t index = 0;
+         index < command.size();
+         ++index) {
+
+      const uint8_t source_byte =
+          static_cast<uint8_t>(
+              command[index]
+          );
+
+
+      for (uint8_t source_bit = 0;
+           source_bit < 8;
+           source_bit += 2) {
+
+        uint8_t encoded_byte = 0xFF;
+
 
         jura_bit_write(
-            rawbyte,
+            encoded_byte,
             2,
-            jura_bit_read(src, static_cast<uint8_t>(s + 0)));
+            jura_bit_read(
+                source_byte,
+                source_bit
+            )
+        );
+
 
         jura_bit_write(
-            rawbyte,
+            encoded_byte,
             5,
-            jura_bit_read(src, static_cast<uint8_t>(s + 1)));
+            jura_bit_read(
+                source_byte,
+                static_cast<uint8_t>(
+                    source_bit + 1
+                )
+            )
+        );
 
-        write(rawbyte);
+
+        write(encoded_byte);
       }
 
+
+      // Jura benötigt eine Pause zwischen logischen Zeichen.
       delay(8);
     }
 
 
-    // -----------------------------------------------------------------------
-    // Decode incoming Jura data
-    // -----------------------------------------------------------------------
-    uint8_t bit_position = 0;
-    uint8_t inbyte = 0;
+    // -------------------------------------------------------------------------
+    // Antwort empfangen
+    //
+    // Wichtig:
+    // Wir warten NICHT mehr ~5 Sekunden.
+    //
+    // Der alte Code hat dadurch den ESPHome Loop Watchdog ausgelöst.
+    // -------------------------------------------------------------------------
 
-    while (!(inbytes.size() >= 2 &&
-             inbytes[inbytes.size() - 2] == '\r' &&
-             inbytes[inbytes.size() - 1] == '\n')) {
+    constexpr uint32_t RESPONSE_TIMEOUT_MS = 1000;
 
-      if (available()) {
-        uint8_t rawbyte = static_cast<uint8_t>(read());
+    const uint32_t response_start =
+        millis();
 
-        jura_bit_write(
-            inbyte,
-            static_cast<uint8_t>(bit_position + 0),
-            jura_bit_read(rawbyte, 2));
 
-        jura_bit_write(
-            inbyte,
-            static_cast<uint8_t>(bit_position + 1),
-            jura_bit_read(rawbyte, 5));
+    uint8_t decoded_byte = 0;
+    uint8_t decoded_bit_position = 0;
 
-        bit_position = static_cast<uint8_t>(bit_position + 2);
 
-        if (bit_position >= 8) {
-          bit_position = 0;
+    while (true) {
 
-          inbytes.push_back(static_cast<char>(inbyte));
 
-          inbyte = 0;
-        }
+      // -----------------------------------------------------------------------
+      // Timeout
+      // -----------------------------------------------------------------------
 
-      } else {
-        delay(10);
-      }
+      if (
+          static_cast<uint32_t>(
+              millis() - response_start
+          )
+          >= RESPONSE_TIMEOUT_MS
+      ) {
 
-      if (timeout_counter++ > 1500) {
-        ESP_LOGW("jura", "Timeout waiting for Jura response");
+        ESP_LOGW(
+            TAG,
+            "Timeout waiting for Jura response after %u ms",
+            static_cast<unsigned>(
+                RESPONSE_TIMEOUT_MS
+            )
+        );
+
         return "";
       }
-    }
 
-    // Strip CR/LF
-    return inbytes.substr(0, inbytes.size() - 2);
+
+      // -----------------------------------------------------------------------
+      // Noch keine Daten
+      // -----------------------------------------------------------------------
+
+      if (!available()) {
+
+        // CPU kurz freigeben.
+        delay(1);
+
+        continue;
+      }
+
+
+      // -----------------------------------------------------------------------
+      // Physisches Jura UART Byte empfangen
+      // -----------------------------------------------------------------------
+
+      const uint8_t raw_byte =
+          static_cast<uint8_t>(
+              read()
+          );
+
+
+      // Nutzbit aus Position 2 übernehmen
+
+      jura_bit_write(
+          decoded_byte,
+          decoded_bit_position,
+          jura_bit_read(
+              raw_byte,
+              2
+          )
+      );
+
+
+      // Nutzbit aus Position 5 übernehmen
+
+      jura_bit_write(
+          decoded_byte,
+          static_cast<uint8_t>(
+              decoded_bit_position + 1
+          ),
+          jura_bit_read(
+              raw_byte,
+              5
+          )
+      );
+
+
+      decoded_bit_position =
+          static_cast<uint8_t>(
+              decoded_bit_position + 2
+          );
+
+
+      // -----------------------------------------------------------------------
+      // Vier UART Bytes ergeben ein dekodiertes Byte
+      // -----------------------------------------------------------------------
+
+      if (decoded_bit_position >= 8) {
+
+        decoded_bit_position = 0;
+
+
+        response.push_back(
+            static_cast<char>(
+                decoded_byte
+            )
+        );
+
+
+        decoded_byte = 0;
+
+
+        // ---------------------------------------------------------------------
+        // Jura Antwort endet auf CR/LF
+        // ---------------------------------------------------------------------
+
+        const size_t response_length =
+            response.size();
+
+
+        if (
+            response_length >= 2 &&
+            response[response_length - 2] == '\r' &&
+            response[response_length - 1] == '\n'
+        ) {
+
+          response.resize(
+              response_length - 2
+          );
+
+
+          ESP_LOGD(
+              TAG,
+              "RX response: %s",
+              response.c_str()
+          );
+
+
+          return response;
+        }
+      }
+    }
   }
 
 
-  void update() override {
-    // -----------------------------------------------------------------------
-    // Counters
-    // -----------------------------------------------------------------------
-    std::string result = cmd2jura("RT:0000");
+  // ===========================================================================
+  // ESPHome Polling
+  // ===========================================================================
 
-    if (result.empty() || result.size() < 64) {
+  void update() override {
+
+    ESP_LOGD(
+        TAG,
+        "Polling Jura model %s",
+        model_.c_str()
+    );
+
+
+    // -------------------------------------------------------------------------
+    // Zähler auslesen
+    // -------------------------------------------------------------------------
+
+    const std::string counter_response =
+        cmd2jura("RT:0000");
+
+
+    // Wenn Jura nicht antwortet:
+    // Update sofort verlassen.
+    //
+    // Dadurch kommt nicht direkt noch ein zweiter Timeout durch IC: hinzu.
+
+    if (counter_response.empty()) {
+
       ESP_LOGW(
-          "jura",
-          "Unexpected RT:0000 response len=%d",
-          static_cast<int>(result.size()));
+          TAG,
+          "No response to RT:0000"
+      );
 
       return;
     }
 
-    std::vector<long> current = parse_all_counters_(result);
 
-    publish_number("counter_1",  get_counter_n_(current, 1));
-    publish_number("counter_2",  get_counter_n_(current, 2));
-    publish_number("counter_3",  get_counter_n_(current, 3));
-    publish_number("counter_4",  get_counter_n_(current, 4));
-    publish_number("counter_5",  get_counter_n_(current, 5));
-    publish_number("counter_6",  get_counter_n_(current, 6));
-    publish_number("counter_7",  get_counter_n_(current, 7));
-    publish_number("counter_8",  get_counter_n_(current, 8));
-    publish_number("counter_9",  get_counter_n_(current, 9));
-    publish_number("counter_10", get_counter_n_(current, 10));
-    publish_number("counter_11", get_counter_n_(current, 11));
-    publish_number("counter_12", get_counter_n_(current, 12));
-    publish_number("counter_13", get_counter_n_(current, 13));
-    publish_number("counter_14", get_counter_n_(current, 14));
-    publish_number("counter_15", get_counter_n_(current, 15));
-    publish_number("counter_16", get_counter_n_(current, 16));
-
-    publish_counter_changes_(current);
+    ESP_LOGD(
+        TAG,
+        "RT:0000 raw response: %s",
+        counter_response.c_str()
+    );
 
 
-    // -----------------------------------------------------------------------
-    // IC flags / machine state
-    // -----------------------------------------------------------------------
-    std::string ic = cmd2jura("IC:");
-
-    if (ic.size() >= 7) {
-      uint8_t a = static_cast<uint8_t>(
-          std::strtol(ic.substr(3, 2).c_str(), nullptr, 16));
-
-      uint8_t b = static_cast<uint8_t>(
-          std::strtol(ic.substr(5, 2).c_str(), nullptr, 16));
-
-      publish_ic_bits_if_changed_(a, b);
-
-      uint8_t tray_bit =
-          jura_bit_read(a, 4);
-
-      uint8_t left_ready_bit =
-          jura_bit_read(a, 2);
-
-      uint8_t tank_bit =
-          jura_bit_read(b, 5);
-
-      uint8_t right_busy_bit =
-          jura_bit_read(b, 6);
+    const std::vector<long> counters =
+        parse_all_counters_(
+            counter_response
+        );
 
 
-      std::string tray_status =
-          (tray_bit == 1) ? "Present" : "Missing";
+    // -------------------------------------------------------------------------
+    // Alle möglichen Counter veröffentlichen
+    //
+    // __init__.py entscheidet, welche davon tatsächlich als ESPHome Sensor
+    // existieren.
+    // -------------------------------------------------------------------------
 
-      std::string tank_status =
-          (tank_bit == 1) ? "Fill Tank" : "OK";
+    publish_number(
+        "counter_1",
+        get_counter_n_(counters, 1)
+    );
 
-      std::string machine_status = "Ready";
+    publish_number(
+        "counter_2",
+        get_counter_n_(counters, 2)
+    );
+
+    publish_number(
+        "counter_3",
+        get_counter_n_(counters, 3)
+    );
+
+    publish_number(
+        "counter_4",
+        get_counter_n_(counters, 4)
+    );
+
+    publish_number(
+        "counter_5",
+        get_counter_n_(counters, 5)
+    );
+
+    publish_number(
+        "counter_6",
+        get_counter_n_(counters, 6)
+    );
+
+    publish_number(
+        "counter_7",
+        get_counter_n_(counters, 7)
+    );
+
+    publish_number(
+        "counter_8",
+        get_counter_n_(counters, 8)
+    );
+
+    publish_number(
+        "counter_9",
+        get_counter_n_(counters, 9)
+    );
+
+    publish_number(
+        "counter_10",
+        get_counter_n_(counters, 10)
+    );
+
+    publish_number(
+        "counter_11",
+        get_counter_n_(counters, 11)
+    );
+
+    publish_number(
+        "counter_12",
+        get_counter_n_(counters, 12)
+    );
+
+    publish_number(
+        "counter_13",
+        get_counter_n_(counters, 13)
+    );
+
+    publish_number(
+        "counter_14",
+        get_counter_n_(counters, 14)
+    );
+
+    publish_number(
+        "counter_15",
+        get_counter_n_(counters, 15)
+    );
+
+    publish_number(
+        "counter_16",
+        get_counter_n_(counters, 16)
+    );
 
 
-      if (tray_bit == 0) {
-        machine_status = "Tray Missing";
-      }
-
-      if (tank_bit == 1) {
-        machine_status = "Fill Tank";
-      }
-
-      if (right_busy_bit == 1) {
-        machine_status = "Busy (Milk Drink)";
-      }
-
-      if (left_ready_bit == 0) {
-        machine_status = "Busy (Coffee Drink)";
-      }
+    publish_counter_changes_(
+        counters
+    );
 
 
-      publish_text(
-          "tray_status",
-          tray_status);
+    // -------------------------------------------------------------------------
+    // Maschinenstatus auslesen
+    // -------------------------------------------------------------------------
 
-      publish_text(
-          "water_tank_status",
-          tank_status);
+    const std::string ic_response =
+        cmd2jura("IC:");
 
-      publish_text(
-          "machine_status",
-          machine_status);
 
-    } else {
+    if (ic_response.empty()) {
+
       ESP_LOGW(
-          "jura",
-          "Unexpected IC response len=%d",
-          static_cast<int>(ic.size()));
+          TAG,
+          "No response to IC:"
+      );
+
+      return;
     }
+
+
+    ESP_LOGD(
+        TAG,
+        "IC raw response: %s",
+        ic_response.c_str()
+    );
+
+
+    // Erwartet wird mindestens:
+    //
+    // IC:XXXX
+    //
+    // Wir brauchen Zeichen 3..6.
+
+    if (ic_response.size() < 7) {
+
+      ESP_LOGW(
+          TAG,
+          "IC response too short: %u",
+          static_cast<unsigned>(
+              ic_response.size()
+          )
+      );
+
+      return;
+    }
+
+
+    // -------------------------------------------------------------------------
+    // Zwei Statusbytes parsen
+    // -------------------------------------------------------------------------
+
+    const uint8_t status_a =
+        static_cast<uint8_t>(
+            std::strtoul(
+                ic_response.substr(
+                    3,
+                    2
+                ).c_str(),
+                nullptr,
+                16
+            )
+        );
+
+
+    const uint8_t status_b =
+        static_cast<uint8_t>(
+            std::strtoul(
+                ic_response.substr(
+                    5,
+                    2
+                ).c_str(),
+                nullptr,
+                16
+            )
+        );
+
+
+    publish_ic_bits_if_changed_(
+        status_a,
+        status_b
+    );
+
+
+    // -------------------------------------------------------------------------
+    // Momentan bekannte Bits
+    //
+    // Achtung:
+    // Diese Zuordnung stammt von anderen Jura-Modellen.
+    // Bei der E75 müssen wir sie später anhand echter Daten verifizieren.
+    // -------------------------------------------------------------------------
+
+    const uint8_t tray_bit =
+        jura_bit_read(
+            status_a,
+            4
+        );
+
+
+    const uint8_t coffee_ready_bit =
+        jura_bit_read(
+            status_a,
+            2
+        );
+
+
+    const uint8_t tank_bit =
+        jura_bit_read(
+            status_b,
+            5
+        );
+
+
+    const uint8_t milk_busy_bit =
+        jura_bit_read(
+            status_b,
+            6
+        );
+
+
+    // -------------------------------------------------------------------------
+    // Textstatus
+    // -------------------------------------------------------------------------
+
+    const std::string tray_status =
+        tray_bit
+            ? "Present"
+            : "Missing";
+
+
+    const std::string tank_status =
+        tank_bit
+            ? "Fill Tank"
+            : "OK";
+
+
+    std::string machine_status =
+        "Ready";
+
+
+    if (!tray_bit) {
+      machine_status =
+          "Tray Missing";
+    }
+
+
+    if (tank_bit) {
+      machine_status =
+          "Fill Tank";
+    }
+
+
+    if (milk_busy_bit) {
+      machine_status =
+          "Busy (Milk Drink)";
+    }
+
+
+    if (!coffee_ready_bit) {
+      machine_status =
+          "Busy (Coffee Drink)";
+    }
+
+
+    publish_text(
+        "tray_status",
+        tray_status
+    );
+
+
+    publish_text(
+        "water_tank_status",
+        tank_status
+    );
+
+
+    publish_text(
+        "machine_status",
+        machine_status
+    );
   }
 
 
  protected:
-  // -------------------------------------------------------------------------
-  // Counter helpers
-  // -------------------------------------------------------------------------
 
-  long get_counter_n_(const std::vector<long> &values, int n) const {
-    if (n < 1) {
+  // ===========================================================================
+  // Counter auslesen
+  // ===========================================================================
+
+  long get_counter_n_(
+      const std::vector<long> &values,
+      int number) const {
+
+    if (number <= 0) {
       return -1;
     }
 
-    const size_t index = static_cast<size_t>(n - 1);
 
-    if (index < values.size()) {
-      return values[index];
+    const size_t index =
+        static_cast<size_t>(
+            number - 1
+        );
+
+
+    if (index >= values.size()) {
+      return -1;
     }
 
-    return -1;
+
+    return values[index];
   }
 
 
-  std::vector<long> parse_all_counters_(const std::string &rt) const {
-    std::vector<long> values;
+  // ===========================================================================
+  // RT Antwort in 4-stellige Hex-Felder zerlegen
+  // ===========================================================================
 
-    // Counter fields contain four hex characters,
-    // starting at position 3.
-    for (size_t pos = 3;
-         pos + 4 <= rt.size();
-         pos += 4) {
+  std::vector<long> parse_all_counters_(
+      const std::string &response) const {
 
-      long value = std::strtol(
-          rt.substr(pos, 4).c_str(),
-          nullptr,
-          16);
+    std::vector<long> result;
 
-      values.push_back(value);
+
+    // Jura Antworten beginnen typischerweise mit "RT:"
+    if (response.size() <= 3) {
+      return result;
     }
 
-    return values;
+
+    for (
+        size_t position = 3;
+        position + 4 <= response.size();
+        position += 4
+    ) {
+
+      const std::string field =
+          response.substr(
+              position,
+              4
+          );
+
+
+      const long value =
+          std::strtol(
+              field.c_str(),
+              nullptr,
+              16
+          );
+
+
+      result.push_back(
+          value
+      );
+    }
+
+
+    return result;
   }
 
 
-  void publish_counter_changes_(const std::vector<long> &current) {
+  // ===========================================================================
+  // Änderungen der Counter erkennen
+  // ===========================================================================
+
+  void publish_counter_changes_(
+      const std::vector<long> &current) {
+
+
+    // Beim ersten Durchlauf nur Ausgangszustand speichern.
+
     if (!last_counters_initialized_) {
-      last_counters_ = current;
-      last_counters_initialized_ = true;
+
+      last_counters_ =
+          current;
+
+      last_counters_initialized_ =
+          true;
 
       return;
     }
 
-    std::string message;
-    bool any = false;
 
-    const size_t max_count =
-        std::max(last_counters_.size(), current.size());
+    std::string changed_text;
 
-    char buffer[48];
+    bool changed =
+        false;
 
 
-    for (size_t i = 0; i < max_count; ++i) {
-      long previous =
-          (i < last_counters_.size())
-              ? last_counters_[i]
+    const size_t count =
+        std::max(
+            last_counters_.size(),
+            current.size()
+        );
+
+
+    for (size_t index = 0;
+         index < count;
+         ++index) {
+
+
+      const long old_value =
+          index < last_counters_.size()
+              ? last_counters_[index]
               : -1;
 
-      long now =
-          (i < current.size())
-              ? current[i]
+
+      const long new_value =
+          index < current.size()
+              ? current[index]
               : -1;
 
 
-      if (previous != now) {
-        if (any) {
-          message += ", ";
-        }
-
-        snprintf(
-            buffer,
-            sizeof(buffer),
-            "counter_%u %ld->%ld",
-            static_cast<unsigned>(i + 1),
-            previous,
-            now);
-
-        message += buffer;
-        any = true;
+      if (old_value == new_value) {
+        continue;
       }
+
+
+      if (changed) {
+        changed_text += ", ";
+      }
+
+
+      char buffer[64];
+
+
+      std::snprintf(
+          buffer,
+          sizeof(buffer),
+          "counter_%u %ld->%ld",
+          static_cast<unsigned>(
+              index + 1
+          ),
+          old_value,
+          new_value
+      );
+
+
+      changed_text +=
+          buffer;
+
+
+      changed =
+          true;
     }
 
 
-    if (any) {
+    if (changed) {
+
       publish_text(
           "counters_changed",
-          message);
+          changed_text
+      );
+
 
       ESP_LOGD(
-          "jura",
-          "Changed: %s",
-          message.c_str());
+          TAG,
+          "Counter changes: %s",
+          changed_text.c_str()
+      );
     }
 
 
-    last_counters_ = current;
+    last_counters_ =
+        current;
   }
 
 
-  // -------------------------------------------------------------------------
-  // IC bit helpers
-  // -------------------------------------------------------------------------
+  // ===========================================================================
+  // Byte als Binärstring darstellen
+  // ===========================================================================
 
-  static inline void byte_to_bits_(uint8_t value, char out[9]) {
-    for (int i = 7; i >= 0; --i) {
-      out[7 - i] =
-          (value & (1U << i))
+  static void byte_to_bits_(
+      uint8_t value,
+      char output[9]) {
+
+    for (uint8_t index = 0;
+         index < 8;
+         ++index) {
+
+      const uint8_t bit =
+          static_cast<uint8_t>(
+              7 - index
+          );
+
+
+      output[index] =
+          jura_bit_read(
+              value,
+              bit
+          )
               ? '1'
               : '0';
     }
 
-    out[8] = '\0';
+
+    output[8] =
+        '\0';
   }
 
 
-  void publish_ic_bits_if_changed_(uint8_t a, uint8_t b) {
-    if (!ic_bits_initialized_ ||
-        a != last_ic_a_ ||
-        b != last_ic_b_) {
+  // ===========================================================================
+  // IC Statusbits nur bei Änderung publizieren
+  // ===========================================================================
 
-      char a_bits[9];
-      char b_bits[9];
-      char buffer[32];
+  void publish_ic_bits_if_changed_(
+      uint8_t value_a,
+      uint8_t value_b) {
 
-      byte_to_bits_(a, a_bits);
-      byte_to_bits_(b, b_bits);
 
-      snprintf(
-          buffer,
-          sizeof(buffer),
-          "A=%s B=%s",
-          a_bits,
-          b_bits);
+    if (
+        ic_bits_initialized_ &&
+        value_a == last_ic_a_ &&
+        value_b == last_ic_b_
+    ) {
 
-      publish_text(
-          "ic_bits",
-          std::string(buffer));
-
-      last_ic_a_ = a;
-      last_ic_b_ = b;
-
-      ic_bits_initialized_ = true;
-
-      ESP_LOGD(
-          "jura",
-          "IC bits changed: %s",
-          buffer);
+      return;
     }
+
+
+    char bits_a[9];
+    char bits_b[9];
+
+
+    byte_to_bits_(
+        value_a,
+        bits_a
+    );
+
+
+    byte_to_bits_(
+        value_b,
+        bits_b
+    );
+
+
+    char buffer[32];
+
+
+    std::snprintf(
+        buffer,
+        sizeof(buffer),
+        "A=%s B=%s",
+        bits_a,
+        bits_b
+    );
+
+
+    publish_text(
+        "ic_bits",
+        std::string(buffer)
+    );
+
+
+    ESP_LOGD(
+        TAG,
+        "IC bits changed: %s",
+        buffer
+    );
+
+
+    last_ic_a_ =
+        value_a;
+
+    last_ic_b_ =
+        value_b;
+
+    ic_bits_initialized_ =
+        true;
   }
 
 
-  // -------------------------------------------------------------------------
-  // Internal state
-  // -------------------------------------------------------------------------
+  // ===========================================================================
+  // Interne Variablen
+  // ===========================================================================
 
-  std::string model_{"UNKNOWN"};
+  std::string model_{
+      "UNKNOWN"
+  };
 
-  std::map<std::string, sensor::Sensor *> numeric_;
 
-  std::map<std::string, text_sensor::TextSensor *> text_;
+  std::map<
+      std::string,
+      sensor::Sensor *
+  > numeric_sensors_;
 
-  std::vector<long> last_counters_;
 
-  bool last_counters_initialized_{false};
+  std::map<
+      std::string,
+      text_sensor::TextSensor *
+  > text_sensors_;
 
-  uint8_t last_ic_a_{0};
 
-  uint8_t last_ic_b_{0};
+  std::vector<long>
+      last_counters_;
 
-  bool ic_bits_initialized_{false};
+
+  bool
+      last_counters_initialized_{
+          false
+      };
+
+
+  uint8_t
+      last_ic_a_{
+          0
+      };
+
+
+  uint8_t
+      last_ic_b_{
+          0
+      };
+
+
+  bool
+      ic_bits_initialized_{
+          false
+      };
 };
 
 
