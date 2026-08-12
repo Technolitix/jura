@@ -533,8 +533,7 @@ class Jura :
     // Maschinenstatus auslesen
     // -------------------------------------------------------------------------
 
-    const std::string ic_response =
-        cmd2jura("IC:");
+
 
 
     if (ic_response.empty()) {
